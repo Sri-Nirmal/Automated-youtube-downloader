@@ -8,20 +8,23 @@ from datetime import datetime
 import yt_dlp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from tqdm import tqdm
 
 # ==================== HARD-CODED DEFAULT CONFIG ====================
 DEFAULT_CSV_FILE = "bachata.csv"
 DEFAULT_DOWNLOAD_FOLDER = "Downloads"
-DEFAULT_MAX_WORKERS = 6
+DEFAULT_MAX_WORKERS = 4
 DEFAULT_MODE = "audio"  # audio | video | both
 DEFAULT_ENABLE_LOGS = False
-DEFAULT_ENABLE_CATEGORIZATION = False
 # ===================================================================
 
 print_lock = threading.Lock()
+progress_lock = threading.Lock()
+progress_positions = {}
+position_counter = 0
 
 
-# ==================== UTILITY ====================
+# ==================== UTILITIES ====================
 
 def sanitize_filename(filename):
     for c in '<>:"/\\|?*':
@@ -52,17 +55,48 @@ def log(msg):
     logging.info(msg)
 
 
-# ==================== FORMAT OPTIONS ====================
+# ==================== PROGRESS BAR ====================
 
-def build_ydl_options(mode, output_template):
+def create_progress_hook(desc, position):
+
+    pbar = tqdm(
+        total=100,
+        desc=desc[:30],
+        position=position,
+        leave=True,
+        unit="%"
+    )
+
+    def hook(d):
+        if d['status'] == 'downloading':
+            percent = d.get('_percent_str', '0%').strip().replace('%', '')
+            try:
+                percent = float(percent)
+                pbar.n = percent
+                pbar.refresh()
+            except:
+                pass
+
+        elif d['status'] == 'finished':
+            pbar.n = 100
+            pbar.refresh()
+            pbar.close()
+
+    return hook
+
+
+# ==================== YDL OPTIONS ====================
+
+def build_ydl_options(mode, output_template, progress_hook):
     base_opts = {
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
         'ignoreerrors': False,
-        'continuedl': True,         # Resume support
-        'overwrites': False,        # Skip existing
+        'continuedl': True,
+        'overwrites': False,
+        'progress_hooks': [progress_hook],
     }
 
     if mode == "audio":
@@ -81,45 +115,44 @@ def build_ydl_options(mode, output_template):
             'merge_output_format': 'mp4',
         })
 
-    elif mode == "both":
-        # We'll handle both separately in download()
-        pass
-
     return base_opts
 
 
-# ==================== DOWNLOAD LOGIC ====================
+# ==================== DOWNLOAD ====================
 
 def download_single(query, filename_base, folder, mode, number=None):
+    global position_counter
+
+    with progress_lock:
+        position = position_counter
+        position_counter += 1
+
     status = f"[{number}] " if number else ""
+    desc = f"{status}{filename_base}"
 
     try:
-        with print_lock:
-            print(f"{status}Downloading: {filename_base}")
         log(f"{status}Downloading: {filename_base}")
 
         if mode in ["audio", "both"]:
+            hook = create_progress_hook(desc + " (Audio)", position)
             audio_out = str(folder / f"{filename_base}.%(ext)s")
-            opts = build_ydl_options("audio", audio_out)
+            opts = build_ydl_options("audio", audio_out, hook)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([query])
 
         if mode in ["video", "both"]:
+            hook = create_progress_hook(desc + " (Video)", position)
             video_out = str(folder / f"{filename_base}.%(ext)s")
-            opts = build_ydl_options("video", video_out)
+            opts = build_ydl_options("video", video_out, hook)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([query])
 
-        with print_lock:
-            print(f"{status}✓ Complete: {filename_base}")
         log(f"{status}✓ Complete")
-
         return True, None
 
     except Exception as e:
-        with print_lock:
-            print(f"{status}✗ Failed: {filename_base} - {str(e)}")
         log(f"{status}✗ Failed - {str(e)}")
+        print(f"{status}✗ Failed: {filename_base}")
         return False, str(e)
 
 
@@ -156,7 +189,7 @@ def parse_csv_row(row):
 
 def main():
 
-    parser = argparse.ArgumentParser(description="YouTube Downloader PRO")
+    parser = argparse.ArgumentParser(description="YouTube Downloader PRO v5")
     parser.add_argument("--csv", help="CSV file input")
     parser.add_argument("--link", help="Single standalone link")
     parser.add_argument("--mode", choices=["audio", "video", "both"])
@@ -179,23 +212,23 @@ def main():
     base.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("YouTube Downloader PRO v4")
+    print("YouTube Downloader PRO v5 (Realtime Progress)")
     print("=" * 70)
     print(f"Mode: {mode}")
     print(f"Download Folder: {base}")
-    print(f"Parallel Workers: {max_workers}")
+    print(f"Workers: {max_workers}")
     print(f"Logging: {'Enabled' if enable_logs else 'Disabled'}")
     if log_file:
         print(f"Log File: {log_file}")
     print("=" * 70)
 
-    # ==================== SINGLE LINK MODE ====================
+    # -------- Single Link Mode --------
     if single_link:
         filename_base = sanitize_filename("Single_Download")
         download_single(single_link, filename_base, base, mode)
         return
 
-    # ==================== CSV MODE ====================
+    # -------- CSV Mode --------
     csv_path = Path(csv_file)
     if not csv_path.exists():
         print(f"CSV file not found: {csv_file}")
@@ -209,10 +242,6 @@ def main():
             song = parse_csv_row(row_lower)
             if song.get("title") or song.get("link"):
                 songs.append(song)
-
-    if not songs:
-        print("No valid songs found.")
-        return
 
     success = 0
     failed = 0
@@ -242,7 +271,7 @@ def main():
             else:
                 failed += 1
 
-    print("=" * 70)
+    print("\n" + "=" * 70)
     print("DOWNLOAD COMPLETE")
     print(f"Success: {success}")
     print(f"Failed: {failed}")
