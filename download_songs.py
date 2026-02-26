@@ -1,233 +1,253 @@
 import os
 import csv
+import sys
+import argparse
+import logging
 from pathlib import Path
+from datetime import datetime
 import yt_dlp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-# ==================== CONFIGURATION ====================
-CSV_FILE = "bachata.csv"                    # CSV filename
-DOWNLOAD_FOLDER = "Bachata"       # Base download folder
-MAX_WORKERS = 8                           # Number of parallel downloads
-ENABLE_CATEGORIZATION = False              # Set to False to skip categorization
-# =======================================================
+# ==================== HARD-CODED DEFAULT CONFIG ====================
+DEFAULT_CSV_FILE = "bachata.csv"
+DEFAULT_DOWNLOAD_FOLDER = "Downloads"
+DEFAULT_MAX_WORKERS = 6
+DEFAULT_MODE = "audio"  # audio | video | both
+DEFAULT_ENABLE_LOGS = False
+DEFAULT_ENABLE_CATEGORIZATION = False
+# ===================================================================
 
 print_lock = threading.Lock()
+
+
+# ==================== UTILITY ====================
 
 def sanitize_filename(filename):
     for c in '<>:"/\\|?*':
         filename = filename.replace(c, '')
     return filename.strip('. ')[:200]
 
-def create_folders(base, enable_cat):
-    if enable_cat:
-        folders = {
-            'salsa': base / "Salsa",
-            'bachata': base / "Bachata",
-            'reggaeton': base / "Reggaeton",
-            'kizomba': base / "Kizomba_Zouk",
-            'other': base / "Other"
-        }
-    else:
-        folders = {'all': base}
-    
-    for f in folders.values():
-        f.mkdir(parents=True, exist_ok=True)
-    return folders
 
-def categorize(title, artist):
-    if not ENABLE_CATEGORIZATION:
-        return 'all'
-    
-    text = (title + " " + artist).lower()
-    
-    bachata_kw = ['romeo santos', 'aventura', 'prince royce', 'monchy', 'frank reyes', 
-                  'zacarias ferreira', 'xtreme', 'domenic marte', 'yoskar sarante', 
-                  'mickey then', 'bachata']
-    if any(k in text for k in bachata_kw):
-        return 'bachata'
-    
-    salsa_kw = ['marc anthony', 'celia cruz', 'joe arroyo', 'willie colon', 'issac delgado',
-                'sonora', 'fruko', 'gran combo', 'johnny pacheco', 'pupy', 'maykel blanco',
-                'van van', 'timbalive', 'manolito', 'trabuco', 'adalberto alvarez',
-                'alexander abreu', 'havana', 'elito reve', 'lazarito', 'bamboleo',
-                'aymee nuviola', 'masiel malaga', 'salsa', 'casino']
-    if any(k in text for k in salsa_kw):
-        return 'salsa'
-    
-    reggaeton_kw = ['daddy yankee', 'ozuna', 'bad bunny', 'j balvin', 'nicky jam',
-                    'maluma', 'anuel', 'karol g', 'becky g', 'cnco', 'wisin', 'don omar',
-                    'arcangel', 'farruko', 'reggaeton', 'luis fonsi', 'despacito']
-    if any(k in text for k in reggaeton_kw):
-        return 'reggaeton'
-    
-    kizomba_kw = ['kizomba', 'zouk', 'badoxa', 'tarraxinha', 'pinto picasso', 'mayinbito',
-                  'dj faze', 'dj husky', 'chris paradise', 'jalil lopez', 'lola jane']
-    if any(k in text for k in kizomba_kw):
-        return 'kizomba'
-    
-    return 'other'
+def setup_logging(enable_logs):
+    if not enable_logs:
+        return None
 
-def download(song_data, folder):
-    title = song_data.get('title', 'Unknown')
-    artist = song_data.get('artist', '')
-    link = song_data.get('link', '')
-    num = song_data.get('number', '')
-    
-    # Determine what to download
-    if link:
-        query = link  # Direct YouTube link
-        display_name = f"{title} - {artist}" if artist else title
-    elif title and artist:
-        query = f"ytsearch1:{title} {artist}"
-        display_name = f"{title} - {artist}"
-    elif title:
-        query = f"ytsearch1:{title}"
-        display_name = title
-    else:
-        return (num, False, "No title or link provided")
-    
-    # Create filename
-    if num:
-        filename_base = f"{num} - {sanitize_filename(title)}"
-    else:
-        filename_base = sanitize_filename(title)
-    
-    if artist:
-        filename_base += f" - {sanitize_filename(artist)}"
-    
-    outfile = str(folder / f"{filename_base}.%(ext)s")
-    
-    opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '320',
-        }],
-        'outtmpl': outfile,
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = logs_dir / f"download_run_{timestamp}.log"
+
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    return log_file
+
+
+def log(msg):
+    logging.info(msg)
+
+
+# ==================== FORMAT OPTIONS ====================
+
+def build_ydl_options(mode, output_template):
+    base_opts = {
+        'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
         'ignoreerrors': False,
+        'continuedl': True,         # Resume support
+        'overwrites': False,        # Skip existing
     }
-    
+
+    if mode == "audio":
+        base_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '320',
+            }],
+        })
+
+    elif mode == "video":
+        base_opts.update({
+            'format': 'bestvideo+bestaudio/best',
+            'merge_output_format': 'mp4',
+        })
+
+    elif mode == "both":
+        # We'll handle both separately in download()
+        pass
+
+    return base_opts
+
+
+# ==================== DOWNLOAD LOGIC ====================
+
+def download_single(query, filename_base, folder, mode, number=None):
+    status = f"[{number}] " if number else ""
+
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            with print_lock:
-                status = f"[{num}] " if num else ""
-                print(f"{status}Downloading: {display_name}")
-            ydl.download([query])
-            with print_lock:
-                print(f"{status}✓ Complete: {display_name}")
-            return (num, True, None)
+        with print_lock:
+            print(f"{status}Downloading: {filename_base}")
+        log(f"{status}Downloading: {filename_base}")
+
+        if mode in ["audio", "both"]:
+            audio_out = str(folder / f"{filename_base}.%(ext)s")
+            opts = build_ydl_options("audio", audio_out)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([query])
+
+        if mode in ["video", "both"]:
+            video_out = str(folder / f"{filename_base}.%(ext)s")
+            opts = build_ydl_options("video", video_out)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([query])
+
+        with print_lock:
+            print(f"{status}✓ Complete: {filename_base}")
+        log(f"{status}✓ Complete")
+
+        return True, None
+
     except Exception as e:
         with print_lock:
-            status = f"[{num}] " if num else ""
-            print(f"{status}✗ Failed: {display_name} - {str(e)}")
-        return (num, False, str(e))
+            print(f"{status}✗ Failed: {filename_base} - {str(e)}")
+        log(f"{status}✗ Failed - {str(e)}")
+        return False, str(e)
 
-def download_task(song_data, folders):
-    title = song_data.get('title', '')
-    artist = song_data.get('artist', '')
-    cat = categorize(title, artist)
-    return download(song_data, folders[cat])
 
-def parse_csv_row(row, headers):
-    """Intelligently parse CSV row with flexible column names"""
+# ==================== CSV PARSER ====================
+
+def parse_csv_row(row):
+    headers = row.keys()
     song_data = {}
-    
-    # Try to find number/index
+
     for key in ['number', 'num', 'index', 'id', '#']:
         if key in headers:
             song_data['number'] = row.get(key, '').strip()
             break
-    
-    # Try to find title
+
     for key in ['title', 'song', 'name', 'track']:
         if key in headers:
             song_data['title'] = row.get(key, '').strip()
             break
-    
-    # Try to find artist
+
     for key in ['artist', 'artists', 'by', 'singer']:
         if key in headers:
             song_data['artist'] = row.get(key, '').strip()
             break
-    
-    # Try to find YouTube link
+
     for key in ['link', 'url', 'youtube', 'youtube_link', 'yt_link']:
         if key in headers:
             song_data['link'] = row.get(key, '').strip()
             break
-    
+
     return song_data
 
+
+# ==================== MAIN ====================
+
 def main():
-    print("="*70)
-    print("YouTube Music Downloader - Flexible & Parallel")
-    print("="*70)
-    
-    base = Path(os.getcwd()) / DOWNLOAD_FOLDER
-    folders = create_folders(base, ENABLE_CATEGORIZATION)
-    csv_file = Path(os.getcwd()) / CSV_FILE
-    
-    if not csv_file.exists():
-        print(f"ERROR: {CSV_FILE} not found in {os.getcwd()}")
+
+    parser = argparse.ArgumentParser(description="YouTube Downloader PRO")
+    parser.add_argument("--csv", help="CSV file input")
+    parser.add_argument("--link", help="Single standalone link")
+    parser.add_argument("--mode", choices=["audio", "video", "both"])
+    parser.add_argument("--workers", type=int)
+    parser.add_argument("--folder", help="Download folder")
+    parser.add_argument("--logs", action="store_true")
+
+    args = parser.parse_args()
+
+    csv_file = args.csv or DEFAULT_CSV_FILE
+    single_link = args.link
+    mode = args.mode or DEFAULT_MODE
+    max_workers = args.workers or DEFAULT_MAX_WORKERS
+    download_folder = args.folder or DEFAULT_DOWNLOAD_FOLDER
+    enable_logs = args.logs or DEFAULT_ENABLE_LOGS
+
+    log_file = setup_logging(enable_logs)
+
+    base = Path(os.getcwd()) / download_folder
+    base.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print("YouTube Downloader PRO v4")
+    print("=" * 70)
+    print(f"Mode: {mode}")
+    print(f"Download Folder: {base}")
+    print(f"Parallel Workers: {max_workers}")
+    print(f"Logging: {'Enabled' if enable_logs else 'Disabled'}")
+    if log_file:
+        print(f"Log File: {log_file}")
+    print("=" * 70)
+
+    # ==================== SINGLE LINK MODE ====================
+    if single_link:
+        filename_base = sanitize_filename("Single_Download")
+        download_single(single_link, filename_base, base, mode)
         return
-    
-    # Read all songs
+
+    # ==================== CSV MODE ====================
+    csv_path = Path(csv_file)
+    if not csv_path.exists():
+        print(f"CSV file not found: {csv_file}")
+        return
+
     songs = []
-    with open(csv_file, 'r', encoding='utf-8') as f:
+    with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        headers = [h.lower() for h in reader.fieldnames]
-        
         for row in reader:
-            # Convert headers to lowercase for case-insensitive matching
             row_lower = {k.lower(): v for k, v in row.items()}
-            song_data = parse_csv_row(row_lower, headers)
-            
-            # Only add if we have at least title or link
-            if song_data.get('title') or song_data.get('link'):
-                songs.append(song_data)
-    
+            song = parse_csv_row(row_lower)
+            if song.get("title") or song.get("link"):
+                songs.append(song)
+
     if not songs:
-        print("ERROR: No valid songs found in CSV!")
+        print("No valid songs found.")
         return
-    
-    print(f"\nCSV File: {CSV_FILE}")
-    print(f"Download Location: {base}")
-    print(f"Total songs: {len(songs)}")
-    print(f"Parallel downloads: {MAX_WORKERS}")
-    print(f"Categorization: {'Enabled' if ENABLE_CATEGORIZATION else 'Disabled'}")
-    print("="*70 + "\n")
-    
+
     success = 0
     failed = 0
-    failed_songs = []
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(download_task, song, folders) for song in songs]
-        
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for song in songs:
+            query = song.get("link") or f"ytsearch1:{song.get('title')} {song.get('artist', '')}"
+            filename_base = sanitize_filename(
+                f"{song.get('number','')} - {song.get('title','')}"
+            )
+            futures.append(
+                executor.submit(
+                    download_single,
+                    query,
+                    filename_base,
+                    base,
+                    mode,
+                    song.get("number")
+                )
+            )
+
         for future in as_completed(futures):
-            num, ok, error = future.result()
+            ok, _ = future.result()
             if ok:
                 success += 1
             else:
                 failed += 1
-                failed_songs.append((num, error))
-    
-    print("\n" + "="*70)
-    print(f"DOWNLOAD COMPLETE!")
-    print(f"Success: {success} | Failed: {failed}")
-    print("="*70)
-    
-    if failed_songs:
-        print("\nFailed downloads:")
-        for num, error in failed_songs[:10]:  # Show first 10
-            print(f"  #{num}: {error}")
-        if len(failed_songs) > 10:
-            print(f"  ... and {len(failed_songs) - 10} more")
+
+    print("=" * 70)
+    print("DOWNLOAD COMPLETE")
+    print(f"Success: {success}")
+    print(f"Failed: {failed}")
+    print("=" * 70)
+
 
 if __name__ == "__main__":
     main()
